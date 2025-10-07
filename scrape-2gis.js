@@ -128,32 +128,64 @@ async function run() {
   const LAST_PAGE = await detectMaxPages();
   console.log(`Найдено страниц в выдаче: ${LAST_PAGE}`);
 
-  // --- Пагинация: строго 1..LAST_PAGE, учитываем уникальные ID карточек ---
+  // --- Пагинация: кликаем по номерам страниц в самом интерфейсе 2ГИС ---
   const seenIds = new Set();
   const urlById = new Map();
-
+  
   for (let p = 1; p <= LAST_PAGE; p++) {
-    const urlp1 = p === 1 ? searchUrl : `${searchUrl}/page/${p}`;
-    const urlp2 = `${searchUrl}?page=${p}`; // запасной формат
-
-    let ok = false;
-    try {
-      await page.goto(urlp1, { waitUntil: "domcontentloaded", timeout: 60000 });
-      ok = true;
-    } catch {
+    if (p === 1) {
+      // мы уже на первой
+    } else {
+      const prevFirst = await getFirstCardId(page);
+  
+      // Пытаемся кликнуть по конкретному номеру страницы
+      const clicked = await page.evaluate((num) => {
+        const els = Array.from(document.querySelectorAll('a,button'));
+        // точное совпадение текста с номером
+        const cand = els.find(el => (el.textContent || "").trim() === String(num));
+        if (cand) {
+          cand.scrollIntoView({block: "center"});
+          cand.click();
+          return true;
+        }
+        // запасной вариант — "Следующая"
+        const next = els.find(el => /Следующая|Далее|›/i.test(el.textContent || ""));
+        if (next) {
+          next.scrollIntoView({block: "center"});
+          next.click();
+          return true;
+        }
+        return false;
+      }, p);
+  
+      if (!clicked) {
+        // последний запасной — прямой переход, если кнопки не нашлись
+        try {
+          await page.goto(`${searchUrl}/page/${p}`, { waitUntil: "domcontentloaded", timeout: 60000 });
+        } catch {
+          await page.goto(`${searchUrl}?page=${p}`, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(()=>{});
+        }
+      }
+  
+      // ждём смены контента: ID первой карточки должен отличаться
       try {
-        await page.goto(urlp2, { waitUntil: "domcontentloaded", timeout: 60000 });
-        ok = true;
-      } catch {}
+        await page.waitForFunction((prev) => {
+          const a = Array.from(document.querySelectorAll("a"))
+            .map(x => x.href)
+            .find(u => (/\/(firm|place|entity)\//.test(u)) && u.includes("2gis."));
+          if (!a) return false;
+          const m = a.match(/\/(firm|place|entity)\/([^\/?#]+)/i);
+          const id = m ? `${m[1]}:${m[2]}` : null;
+          return id && id !== prev;
+        }, { timeout: 8000 }, prevFirst);
+      } catch (e) {
+        // если не распознали смену — продолжим, но это сигнал, что страница могла не переключиться
+      }
     }
-    if (!ok) {
-      console.log(`Страница ${p}: не открылась, пропускаю`);
-      continue;
-    }
-
+  
     await sleep(900);
     await autoScroll(page);
-
+  
     const foundLinks = await page.evaluate(() => {
       const as = Array.from(document.querySelectorAll("a"));
       return Array.from(new Set(
@@ -162,20 +194,21 @@ async function run() {
           .filter(u => (/\/(firm|place|entity)\//.test(u)) && u.includes("2gis."))
       ));
     });
-
+  
     let addedHere = 0;
     for (const link of foundLinks) {
-      const id = extractId(link);
+      const m = (link.match(/\/(firm|place|entity)\/([^\/?#]+)/i) || []);
+      const id = m[1] && m[2] ? `${m[1]}:${m[2]}` : null;
       if (!id) continue;
       if (!seenIds.has(id)) {
         seenIds.add(id);
-        if (!urlById.has(id)) urlById.set(id, normalizeUrl(link)); // первый нормализованный URL
+        if (!urlById.has(id)) urlById.set(id, (new URL(link)).origin + (new URL(link)).pathname.replace(/\/$/, ""));
         addedHere++;
       }
     }
     console.log(`Страница ${p}/${LAST_PAGE}: найдено ссылок=${foundLinks.length}, новых ID=${addedHere}`);
   }
-
+  
   const cardLinks = Array.from(urlById.values());
   console.log(`Найдено уникальных карточек по ID: ${cardLinks.length}`);
 
